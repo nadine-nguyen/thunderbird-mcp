@@ -2252,6 +2252,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
             recurrence: { type: "string", description: "Single iCalendar RRULE (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU' or 'RRULE:FREQ=DAILY;COUNT=10'). Optional case-insensitive RRULE: prefix. Control characters, malformed rules, SECONDLY/MINUTELY, and HOURLY on all-day events are rejected. Validated with Thunderbird's recurrence parser." },
+            reminders: { type: "array", items: { type: "integer", minimum: 0, maximum: 40320 }, maxItems: 10, description: "Display alarms to add, as whole minutes before the event starts (0 = at the start). One alarm per entry; at most 10." },
             attendees: { type: "array", items: attendeeSchema, description: "Attendees to invite. A non-empty list requires disabling Block skipReview, even when opening a review dialog: Exchange/Owl or CalDAV can email the event title/description without review. Omit, use null, or [] for no attendees. Organizer is initialized from the calendar identity; a missing calendar organizerId may be set." },
             skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
@@ -2990,6 +2991,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let CalEvent = null;
             let CalTodo = null;
             let CalAttendee = null;
+            let CalAlarm = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -3007,6 +3009,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalAttendee.sys.mjs"
               );
               CalAttendee = CA;
+              try {
+                const { CalAlarm: CAl } = ChromeUtils.importESModule(
+                  "resource:///modules/CalAlarm.sys.mjs"
+                );
+                CalAlarm = CAl;
+              } catch {
+                // Alarms unavailable: only createEvent's `reminders` option is affected
+              }
             } catch {
               // Calendar not available
             }
@@ -5959,9 +5969,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               event.organizer = organizer;
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence, attendees) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence, attendees, reminders) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
+              }
+              const reminderResult = normalizeReminders(reminders);
+              if (reminderResult.error) return { error: reminderResult.error };
+              if (reminderResult.minutes.length > 0 && !CalAlarm) {
+                return { error: "Reminders are not available in this Thunderbird version" };
               }
               if (attendees != null) {
                 if (!Array.isArray(attendees)) return { error: "attendees must be an array" };
@@ -6079,6 +6094,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (attendees && attendees.length > 0) {
                   for (const entry of attendees) event.addAttendee(buildAttendee(entry));
                 }
+                for (const minutes of reminderResult.minutes) {
+                  event.addAlarm(buildReminderAlarm(title, minutes));
+                }
 
                 // Find target calendar
                 const calendars = getEnabledCalendars(calendarId);
@@ -6153,6 +6171,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               cancelled: "CANCELLED",
               canceled: "CANCELLED",
             };
+            // Validate createEvent's `reminders` (minutes before start). Returns
+            // { minutes } (unique, largest first) or { error }.
+            const MAX_REMINDERS = 10;
+            const MAX_REMINDER_MINUTES = 40320; // 4 weeks
+            function normalizeReminders(reminders) {
+              if (reminders === undefined || reminders === null) return { minutes: [] };
+              if (!Array.isArray(reminders)) {
+                return { error: "reminders must be an array of whole minutes before the event start" };
+              }
+              if (reminders.length > MAX_REMINDERS) {
+                return { error: `reminders accepts at most ${MAX_REMINDERS} entries` };
+              }
+              for (let i = 0; i < reminders.length; i++) {
+                const m = reminders[i];
+                if (typeof m !== "number" || !Number.isInteger(m) || m < 0 || m > MAX_REMINDER_MINUTES) {
+                  return { error: `reminders[${i}] must be a whole number of minutes between 0 and ${MAX_REMINDER_MINUTES}` };
+                }
+              }
+              return { minutes: [...new Set(reminders)].sort((a, b) => b - a) };
+            }
+
+            // One DISPLAY alarm firing `minutes` before the event start (0 = at start).
+            function buildReminderAlarm(title, minutes) {
+              const alarm = new CalAlarm();
+              alarm.action = "DISPLAY";
+              alarm.description = title;
+              alarm.related = Ci.calIAlarm.ALARM_RELATED_START;
+              const offset = cal.createDuration();
+              offset.inSeconds = minutes === 0 ? 0 : -minutes * 60;
+              alarm.offset = offset;
+              return alarm;
+            }
+
             function normalizeEventStatus(status) {
               if (status === undefined || status === null) return null;
               return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
@@ -11358,7 +11409,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.attendees);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.attendees, args.reminders);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
