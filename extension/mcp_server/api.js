@@ -6780,7 +6780,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               if (location !== undefined) { targetItem.setProperty("LOCATION", location); changes.push("location"); }
-              if (description !== undefined) { targetItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+              // descriptionText clears a stale ALTREP (HTML copy); setProperty would keep it.
+              if (description !== undefined) { targetItem.descriptionText = description; changes.push("description"); }
 
               return { changes };
             }
